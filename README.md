@@ -14,7 +14,7 @@ git clone https://github.com/zijin-c/goodstack-server-checker.git && cd goodstac
 
 ## 日期字段
 
-公开搜索卡片本身不显示 `createdAt` 和 `claimedAt`。为保留原先需要的日期筛选，脚本只观察 Chromium 在提交公开搜索表单后，由网页自身加载的搜索结果响应；它不自己发起 API 查询、不使用 Goodstack API key。只有搜索响应包含这两个日期且候选与名单精确匹配时，才写入 `both_dates.json`。如果 Goodstack 改变网页或响应不再包含日期，日期结果会为空，页面可见结果仍保留在完整结果文件中。
+公开搜索卡片本身不显示 `createdAt` 和 `claimedAt`。脚本像本地工具一样监听 Chromium 的网络响应：先通过公开网页提交机构名称搜索，再读取该页面自行加载的搜索结果响应；不需要 Goodstack API key。只有候选与名单精确匹配、且响应中两个日期都非空的记录才会出现在 `both_dates.csv` 和 `both_dates.json`。如果网页改版或响应不再包含日期，这两个筛选文件会为空。
 
 ## 动态代理
 
@@ -22,9 +22,9 @@ git clone https://github.com/zijin-c/goodstack-server-checker.git && cd goodstac
 
 ## 输出
 
-- `data/results/summary.csv`：逐机构摘要，包括页面搜索状态和两个日期。
-- `data/results/both_dates.json`：名称/登记号/官网精确匹配，且 `createdAt` 与 `claimedAt` 都有值的结果。
-- `data/results/checkpoint.jsonl`：每次搜索的完整记录，中断续跑依据。
+- `data/results/both_dates.csv`：仅含精确匹配且 `createdAt`、`claimedAt` 都有值的机构。
+- `data/results/both_dates.json`：同一筛选结果，包含完整 Goodstack 组织对象。
+- `data/results/checkpoint.jsonl`：内部断点文件，保留所有搜索状态以便中断续跑；请用上面的双日期文件作为最终筛选结果。
 - `data/results/summary.json`：总体计数和结果索引。
 
 页面显示“未找到”仅代表该次公开页面搜索无结果，不代表机构不存在或不符合 CRA 资格。名称候选应结合登记编号人工复核。

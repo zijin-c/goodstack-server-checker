@@ -453,7 +453,7 @@ def save_outputs(out_dir: Path, checkpoint: Path, input_count: int) -> None:
         for candidate in result.get("candidates", []):
             org = candidate.get("organisation", {})
             if candidate.get("matchGrade") != "review_candidate" and org.get("createdAt") and org.get("claimedAt"):
-                both_rows.append({"target": {key: result.get(key) for key in ("inputName", "legalName", "registrationNumber", "officialDomain", "detectedDomain")}, "matchGrade": candidate["matchGrade"], "createdAt": org["createdAt"], "claimedAt": org["claimedAt"], "organisation": org})
+                both_rows.append({"target": {key: result.get(key) for key in ("inputName", "legalName", "registrationNumber", "officialWebsite", "officialDomain", "detectedDomain")}, "matchGrade": candidate["matchGrade"], "createdAt": org["createdAt"], "claimedAt": org["claimedAt"], "checkedAt": result.get("checkedAt", ""), "organisation": org})
     summary = {
         "generatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "inputRecordCount": input_count,
         "processedRecordCount": len(results), "exactMatchCount": sum(bool(r.get("exactCandidateCount")) for r in results),
@@ -464,24 +464,40 @@ def save_outputs(out_dir: Path, checkpoint: Path, input_count: int) -> None:
         "queryErrorCount": sum(r.get("status") in {"query_error", "browser_challenge"} for r in results),
         "bothDatesCandidateCount": len(both_rows), "dateFields": ["createdAt", "claimedAt"],
         "method": "Playwright Chromium operating Goodstack public search page; no direct API requests",
-        "results": "results.jsonl", "bothDatesResults": "both_dates.json",
+        "filteredCsv": "both_dates.csv", "bothDatesResults": "both_dates.json",
     }
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "both_dates.json").write_text(json.dumps({"summary": summary, "results": both_rows}, ensure_ascii=False, indent=2), encoding="utf-8")
     (out_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    fields = ["inputName", "legalName", "registrationNumber", "countryCode", "officialDomain", "detectedDomain", "status", "visibleResultCount", "candidateCount", "exactCandidateCount", "bothDatesCandidateCount", "matchedNames", "matchedIds", "matchedCreatedAt", "matchedClaimedAt", "checkedAt", "errors"]
-    with (out_dir / "summary.csv").open("w", encoding="utf-8-sig", newline="") as stream:
+    fields = [
+        "inputName", "legalName", "inputRegistrationNumber", "inputOfficialWebsite", "inputDomain",
+        "matchGrade", "goodstackId", "goodstackName", "displayName", "countryCode", "registryName",
+        "registryId", "website", "websites", "address", "addressLine1", "addressLine2", "city",
+        "state", "postcode", "registrationDate", "createdAt", "claimedAt", "checkedAt",
+    ]
+    with (out_dir / "both_dates.csv").open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
-        for result in results:
-            exact = [c["organisation"] for c in result.get("candidates", []) if c.get("matchGrade") != "review_candidate"]
+        for match in both_rows:
+            target = match["target"]
+            org = match["organisation"]
             writer.writerow({
-                **{key: result.get(key, "") for key in fields if key in result},
-                "matchedNames": "; ".join(str(x.get("name") or x.get("displayName") or "") for x in exact),
-                "matchedIds": "; ".join(str(x.get("id") or "") for x in exact),
-                "matchedCreatedAt": "; ".join(str(x.get("createdAt") or "") for x in exact),
-                "matchedClaimedAt": "; ".join(str(x.get("claimedAt") or "") for x in exact),
-                "errors": "; ".join(result.get("errors", [])),
+                "inputName": target.get("inputName", ""),
+                "legalName": target.get("legalName", ""),
+                "inputRegistrationNumber": target.get("registrationNumber", ""),
+                "inputOfficialWebsite": target.get("officialWebsite", ""),
+                "inputDomain": target.get("officialDomain", "") or target.get("detectedDomain", ""),
+                "matchGrade": match.get("matchGrade", ""),
+                "goodstackId": org.get("id", ""),
+                "goodstackName": org.get("name", ""),
+                "displayName": org.get("displayName", ""),
+                "countryCode": org.get("countryCode", ""),
+                "registryName": org.get("registryName", ""),
+                "registryId": org.get("registryId", ""),
+                "website": org.get("website", ""),
+                "websites": "; ".join(org.get("websites", [])) if isinstance(org.get("websites"), list) else org.get("websites", ""),
+                **{key: org.get(key, "") for key in ("address", "addressLine1", "addressLine2", "city", "state", "postcode", "registrationDate", "createdAt", "claimedAt")},
+                "checkedAt": match.get("checkedAt", ""),
             })
 
 
@@ -518,7 +534,7 @@ def main() -> int:
     pending = [row for row in targets if row["inputKey"] not in completed]
     print(f"名单 {len(records)} 条；去重后目标 {len(targets)} 家；已完成 {len(completed)} 家；本轮 {len(pending)} 家。")
     print("搜索方式：Chromium 浏览器自动填写 Goodstack 公开页面；不需要 Goodstack API key。")
-    print("日期筛选：仅在网页搜索加载的数据中确实包含 createdAt 和 claimedAt 时才收录到 both_dates.json。")
+    print("日期筛选：both_dates.csv 和 both_dates.json 只输出与名单精确匹配且 createdAt、claimedAt 均有值的记录。")
     proxy = ProxyRotator()
     print(f"代理模式：{proxy.mode}")
     try:
@@ -559,7 +575,7 @@ def main() -> int:
         finally:
             browser.close()
     save_outputs(args.output_dir, checkpoint, len(targets))
-    print(f"完成：{args.output_dir / 'summary.csv'}；双日期结果：{args.output_dir / 'both_dates.json'}")
+    print(f"完成：双日期筛选结果 {args.output_dir / 'both_dates.csv'} 与 {args.output_dir / 'both_dates.json'}")
     return 0
 
 
