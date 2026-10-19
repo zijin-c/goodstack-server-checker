@@ -1,0 +1,13 @@
+services:
+  goodstack-check:
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/data
+    command:
+      - --input
+      - /data/input.json
+      - --output-dir
+      - /data/results
+      - --delay
+      - "1.0"
