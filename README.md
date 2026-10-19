@@ -47,4 +47,4 @@ docker compose logs -f goodstack-check
 cat data/results/summary.json
 ```
 
-默认每次页面搜索间隔 2 秒；2300 条记录可能运行数小时。控制台和批次任务会在 Docker 后台运行，关闭浏览器不影响任务。
+默认使用 3 个独立 Chromium 工作线程，可在 UI 里选择 1–6 个；每个线程使用独立 Playwright 驱动和浏览器，不共享页面对象。并发数越高越快，也越容易遇到网站限流，建议先用 2–3 个。每次网页搜索默认间隔 2 秒。控制台和批次任务会在 Docker 后台运行，关闭浏览器不影响任务。

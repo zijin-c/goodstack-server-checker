@@ -12,16 +12,19 @@ import argparse
 import csv
 import json
 import os
+import queue
 import re
 import sys
+import threading
 import time
 import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, ContextManager, Iterator
 
 SEARCH_URL = "https://causes.goodstack.io/claim?utm_source=goodstack_org"
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
@@ -85,6 +88,7 @@ class ProxyRotator:
         self.dashboard_enabled = True
         self.dashboard_mtime = 0.0
         self.dashboard_config_present = False
+        self.lock = threading.Lock()
         self._refresh_dashboard_settings()
         if self.gateway and self.list_url:
             raise SearchError("GOODSTACK_PROXY_URL 与 GOODSTACK_PROXY_LIST_URL 只能配置一个")
@@ -179,6 +183,10 @@ class ProxyRotator:
             raise SearchError(f"获取代理列表失败：{exc}") from exc
 
     def next_proxy(self) -> dict[str, str] | None:
+        with self.lock:
+            return self._next_proxy()
+
+    def _next_proxy(self) -> dict[str, str] | None:
         self._refresh_dashboard_settings()
         if self.dashboard_config_present and (not self.dashboard_enabled or not self.dashboard_proxies):
             return None
@@ -471,6 +479,99 @@ def check_target(browser: Any, proxy: ProxyRotator, target: dict[str, Any], dela
         context.close()
 
 
+@contextmanager
+def browser_worker_context(proxy: ProxyRotator, delay: float, timeout: int) -> Iterator[Callable[[dict[str, Any]], dict[str, Any]]]:
+    """Give each worker thread its own Playwright driver and Chromium instance."""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        try:
+            yield lambda target: check_target(browser, proxy, target, delay, timeout)
+        finally:
+            browser.close()
+
+
+def error_result(target: dict[str, Any], exc: Exception) -> dict[str, Any]:
+    return {
+        "inputKey": target["inputKey"], "inputName": target["inputName"], "legalName": target["legalName"],
+        "registrationNumber": target["registrationNumber"], "countryCode": target["countryCode"],
+        "officialWebsite": target["officialWebsite"], "officialDomain": target["officialDomain"],
+        "detectedDomain": target["detectedDomain"], "status": "query_error", "candidateCount": 0,
+        "exactCandidateCount": 0, "bothDatesCandidateCount": 0, "candidates": [],
+        "errors": [f"{type(exc).__name__}: {exc}"], "searchMethod": "chromium_public_page",
+        "checkedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "sourceRecord": target["sourceRecord"],
+    }
+
+
+def run_parallel(
+    targets: list[dict[str, Any]],
+    worker_count: int,
+    worker_context_factory: Callable[[], ContextManager[Callable[[dict[str, Any]], dict[str, Any]]]],
+    on_result: Callable[[dict[str, Any]], None],
+) -> None:
+    """Process targets concurrently while keeping each browser on its owning thread."""
+    if not targets:
+        return
+    jobs: queue.Queue[dict[str, Any] | None] = queue.Queue()
+    messages: queue.Queue[tuple[str, Any]] = queue.Queue()
+    stop_event = threading.Event()
+    for target in targets:
+        jobs.put(target)
+    for _ in range(worker_count):
+        jobs.put(None)
+
+    def worker_main(worker_id: int) -> None:
+        try:
+            with worker_context_factory() as process_target:
+                while not stop_event.is_set():
+                    target = jobs.get()
+                    if target is None:
+                        break
+                    print(f"线程 {worker_id} 正在搜索：{target.get('inputName', '')}", flush=True)
+                    try:
+                        result = process_target(target)
+                    except Exception as exc:
+                        result = error_result(target, exc)
+                        print(f"错误：{target['inputName']} — {exc}", file=sys.stderr, flush=True)
+                    messages.put(("result", result))
+                    if result.get("status") == "browser_challenge":
+                        stop_event.set()
+        except Exception as exc:
+            messages.put(("fatal", f"工作线程 {worker_id} 启动失败：{type(exc).__name__}: {exc}"))
+            stop_event.set()
+        finally:
+            messages.put(("done", worker_id))
+
+    threads = [threading.Thread(target=worker_main, args=(index + 1,), name=f"goodstack-worker-{index + 1}") for index in range(worker_count)]
+    for thread in threads:
+        thread.start()
+    finished_workers = 0
+    fatal_error = ""
+    try:
+        while finished_workers < worker_count:
+            try:
+                kind, payload = messages.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if kind == "result":
+                on_result(payload)
+            elif kind == "fatal":
+                fatal_error = fatal_error or str(payload)
+                print(str(payload), file=sys.stderr, flush=True)
+            elif kind == "done":
+                finished_workers += 1
+    except KeyboardInterrupt:
+        stop_event.set()
+        raise
+    finally:
+        stop_event.set() if fatal_error else None
+        for thread in threads:
+            thread.join()
+    if fatal_error:
+        raise RuntimeError(fatal_error)
+
+
 def save_outputs(out_dir: Path, checkpoint: Path, input_count: int) -> None:
     latest: dict[str, dict[str, Any]] = {}
     if checkpoint.exists():
@@ -544,10 +645,11 @@ def main() -> int:
     parser.add_argument("--delay", type=float, default=2.0, help="每次页面搜索后的等待秒数")
     parser.add_argument("--timeout", type=int, default=45, help="页面加载/搜索超时秒数")
     parser.add_argument("--max-records", type=int, default=0, help="只处理前 N 家；0 表示全部")
+    parser.add_argument("--workers", type=int, default=3, help="并发浏览器线程数，范围 1–6")
     parser.add_argument("--no-resume", action="store_true", help="忽略已有 checkpoint")
     args = parser.parse_args()
-    if args.delay < 0 or args.timeout < 10 or args.max_records < 0:
-        parser.error("--delay、--timeout 或 --max-records 参数无效")
+    if args.delay < 0 or args.timeout < 10 or args.max_records < 0 or not 1 <= args.workers <= 6:
+        parser.error("--delay、--timeout、--max-records 或 --workers 参数无效（workers 范围 1–6）")
     if not args.input.exists():
         parser.error(f"输入文件不存在：{args.input}")
     records = load_records(args.input)
@@ -571,44 +673,39 @@ def main() -> int:
     print("搜索方式：Chromium 浏览器自动填写 Goodstack 公开页面；不需要 Goodstack API key。")
     print("日期筛选：both_dates.csv 和 both_dates.json 只输出与名单精确匹配且 createdAt、claimedAt 均有值的记录。")
     proxy = ProxyRotator()
-    print(f"代理模式：{proxy.mode}")
+    print(f"代理模式：{proxy.mode}；并发数：{args.workers}")
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         parser.error("Playwright 未安装；容器部署会自动安装。")
-    with checkpoint.open("a", encoding="utf-8") as stream, sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+    completed_this_run = 0
+    with checkpoint.open("a", encoding="utf-8") as stream:
+        def record_result(result: dict[str, Any]) -> None:
+            nonlocal completed_this_run
+            stream.write(json.dumps(result, ensure_ascii=False) + "\n")
+            stream.flush()
+            completed_this_run += 1
+            print(f"进度 {completed_this_run}/{len(pending)}；最近：{result.get('inputName', '')} → {result.get('status', '')}", flush=True)
+            if completed_this_run % 10 == 0:
+                save_outputs(args.output_dir, checkpoint, len(targets))
+            if result.get("status") == "browser_challenge":
+                print("检测到真人验证，停止后续自动查询。请稍后手动处理，脚本不会尝试绕过验证。", file=sys.stderr, flush=True)
+
         try:
-            for index, target in enumerate(pending, start=1):
-                try:
-                    result = check_target(browser, proxy, target, args.delay, args.timeout)
-                except KeyboardInterrupt:
-                    raise
-                except Exception as exc:
-                    result = {
-                        "inputKey": target["inputKey"], "inputName": target["inputName"], "legalName": target["legalName"],
-                        "registrationNumber": target["registrationNumber"], "countryCode": target["countryCode"],
-                        "officialWebsite": target["officialWebsite"], "officialDomain": target["officialDomain"],
-                        "detectedDomain": target["detectedDomain"], "status": "query_error", "candidateCount": 0,
-                        "exactCandidateCount": 0, "bothDatesCandidateCount": 0, "candidates": [],
-                        "errors": [f"{type(exc).__name__}: {exc}"], "searchMethod": "chromium_public_page",
-                        "checkedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "sourceRecord": target["sourceRecord"],
-                    }
-                    print(f"错误：{target['inputName']} — {exc}", file=sys.stderr)
-                stream.write(json.dumps(result, ensure_ascii=False) + "\n")
-                stream.flush()
-                if result.get("status") == "browser_challenge":
-                    print("检测到真人验证，停止后续自动查询。请稍后手动处理，脚本不会尝试绕过验证。", file=sys.stderr)
-                    break
-                if index % 10 == 0 or index == len(pending):
-                    print(f"进度 {index}/{len(pending)}；最近：{target['inputName']} → {result['status']}")
-                    save_outputs(args.output_dir, checkpoint, len(targets))
+            run_parallel(
+                pending,
+                min(args.workers, max(1, len(pending))),
+                lambda: browser_worker_context(proxy, args.delay, args.timeout),
+                record_result,
+            )
         except KeyboardInterrupt:
-            print("已中断；checkpoint 已保留，重新运行同一命令可从未完成记录续跑。", file=sys.stderr)
+            print("已中断；正在等待进行中的页面搜索收尾，并保留已完成断点。", file=sys.stderr, flush=True)
             save_outputs(args.output_dir, checkpoint, len(targets))
             return 130
-        finally:
-            browser.close()
+        except RuntimeError as exc:
+            print(f"任务启动失败：{exc}", file=sys.stderr, flush=True)
+            save_outputs(args.output_dir, checkpoint, len(targets))
+            return 1
     save_outputs(args.output_dir, checkpoint, len(targets))
     print(f"完成：双日期筛选结果 {args.output_dir / 'both_dates.csv'} 与 {args.output_dir / 'both_dates.json'}")
     return 0

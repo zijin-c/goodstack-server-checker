@@ -325,7 +325,11 @@ class Handler(BaseHTTPRequestHandler):
         if mode not in {"pilot", "full", "recheck"}:
             self.send_json({"error": "Invalid run mode"}, 400)
             return
-        command = ["python", str(ROOT / "goodstack_batch_verify.py"), "--input", str(INPUT), "--output-dir", str(OUT)]
+        workers = payload.get("workers", 3)
+        if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= 6:
+            self.send_json({"error": "并发数需在 1 到 6 之间"}, 400)
+            return
+        command = ["python", str(ROOT / "goodstack_batch_verify.py"), "--input", str(INPUT), "--output-dir", str(OUT), "--workers", str(workers)]
         if mode == "pilot":
             command.extend(["--max-records", "20"])
         elif mode == "recheck":
