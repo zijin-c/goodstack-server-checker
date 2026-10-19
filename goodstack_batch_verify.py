@@ -80,11 +80,38 @@ class ProxyRotator:
         self.proxies: list[str] = []
         self.refreshed_at = 0.0
         self.position = 0
+        self.dashboard_config = Path(os.getenv("DATA_DIR", "/data")) / "proxy_settings.json"
+        self.dashboard_proxies: list[str] = []
+        self.dashboard_enabled = True
+        self.dashboard_mtime = 0.0
+        self.dashboard_config_present = False
+        self._refresh_dashboard_settings()
         if self.gateway and self.list_url:
             raise SearchError("GOODSTACK_PROXY_URL 与 GOODSTACK_PROXY_LIST_URL 只能配置一个")
 
+    def _refresh_dashboard_settings(self) -> None:
+        try:
+            modified = self.dashboard_config.stat().st_mtime_ns
+            if modified != self.dashboard_mtime:
+                settings = json.loads(self.dashboard_config.read_text(encoding="utf-8"))
+                self.dashboard_proxies = [self.normalise_proxy(value) for value in settings.get("proxies", []) if isinstance(value, str)]
+                self.dashboard_enabled = bool(settings.get("enabled", True))
+                self.dashboard_mtime = modified
+                self.dashboard_config_present = True
+                self.position = 0
+        except FileNotFoundError:
+            self.dashboard_proxies = []
+            self.dashboard_enabled = True
+            self.dashboard_config_present = False
+        except (OSError, json.JSONDecodeError, SearchError) as exc:
+            raise SearchError(f"读取控制台代理设置失败：{exc}") from exc
+
     @property
     def mode(self) -> str:
+        if self.dashboard_config_present:
+            return "dashboard_proxy_pool" if self.dashboard_proxies and self.dashboard_enabled else "direct"
+        if self.dashboard_proxies and self.dashboard_enabled:
+            return "dashboard_proxy_pool"
         if self.gateway:
             return "rotating_gateway"
         if self.list_url:
@@ -152,7 +179,15 @@ class ProxyRotator:
             raise SearchError(f"获取代理列表失败：{exc}") from exc
 
     def next_proxy(self) -> dict[str, str] | None:
-        if self.gateway:
+        self._refresh_dashboard_settings()
+        if self.dashboard_config_present and (not self.dashboard_enabled or not self.dashboard_proxies):
+            return None
+        if not self.dashboard_enabled:
+            return None
+        if self.dashboard_proxies:
+            raw = self.dashboard_proxies[self.position % len(self.dashboard_proxies)]
+            self.position += 1
+        elif self.gateway:
             raw = self.normalise_proxy(self.gateway)
         elif self.list_url:
             if not self.proxies or time.monotonic() - self.refreshed_at >= self.refresh_seconds:

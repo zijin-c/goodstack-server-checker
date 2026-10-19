@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
 import hmac
 import json
 import os
 import signal
 import subprocess
 import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -24,6 +29,61 @@ PASSWORD = os.getenv("UI_PASSWORD", "")
 PORT = int(os.getenv("UI_INTERNAL_PORT", "8765"))
 worker: subprocess.Popen | None = None
 worker_lock = threading.Lock()
+proxy_lock = threading.Lock()
+PROXY_CONFIG = DATA / "proxy_settings.json"
+
+
+def proxy_id(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def load_proxy_settings() -> dict:
+    settings = read_json(PROXY_CONFIG, None)
+    if isinstance(settings, dict):
+        proxies = settings.get("proxies", [])
+        return {"enabled": bool(settings.get("enabled", True)), "proxies": proxies if isinstance(proxies, list) else []}
+    # Preserve a proxy configured during the original deploy.sh setup.
+    gateway = os.getenv("GOODSTACK_PROXY_URL", "").strip()
+    if gateway:
+        return {"enabled": True, "proxies": [gateway]}
+    return {"enabled": True, "proxies": []}
+
+
+def safe_proxy_label(value: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(value if "://" in value else "http://" + value)
+        host = parsed.hostname or "invalid host"
+        if ":" in host:
+            host = f"[{host}]"
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://{'••••@' if parsed.username else ''}{host}{port}"
+    except ValueError:
+        return "格式无效"
+
+
+def test_proxy(value: str) -> dict:
+    """Check outbound connectivity and report the proxy's observed public IP."""
+    try:
+        from goodstack_batch_verify import ProxyRotator, SearchError
+        normalised = ProxyRotator.normalise_proxy(value)
+        parsed = urllib.parse.urlsplit(normalised)
+        if not parsed.hostname or not parsed.port or not 1 <= parsed.port <= 65535:
+            raise SearchError("代理地址必须包含有效主机名和端口")
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": normalised, "https": normalised}))
+        request = urllib.request.Request("https://api.ipify.org?format=json", headers={"Accept": "application/json", "User-Agent": "GoodstackDashboard/1.0"})
+        started = time.monotonic()
+        with opener.open(request, timeout=15) as response:
+            body = json.loads(response.read(4096).decode("utf-8", "replace"))
+        ip = str(body.get("ip", "")).strip()
+        if not ip:
+            raise ValueError("IP 查询服务没有返回地址")
+        return {"ok": True, "ip": ip, "latencyMs": round((time.monotonic() - started) * 1000)}
+    except Exception as exc:
+        # Do not echo the proxy URL: it may contain a username/password.
+        reason = str(exc)
+        if isinstance(exc, urllib.error.URLError):
+            reason = str(exc.reason)
+        return {"ok": False, "error": f"{type(exc).__name__}: {reason[:180]}"}
 
 
 def read_json(path: Path, fallback):
@@ -106,6 +166,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(body, "text/html; charset=utf-8")
         elif path == "/api/status":
             self.status()
+        elif path == "/api/proxies":
+            settings = load_proxy_settings()
+            self.send_json({
+                "enabled": settings["enabled"],
+                "proxies": [{"id": proxy_id(value), "label": safe_proxy_label(value)} for value in settings["proxies"] if isinstance(value, str)],
+            })
         elif path == "/api/results":
             query = parse_qs(urlparse(self.path).query)
             try:
@@ -170,8 +236,79 @@ class Handler(BaseHTTPRequestHandler):
             self.start_worker()
         elif path == "/api/stop":
             self.stop_worker()
+        elif path == "/api/proxies":
+            self.update_proxies()
+        elif path == "/api/proxy-test":
+            self.proxy_test()
         else:
             self.send_json({"error": "Not found"}, 404)
+
+    def read_post_json(self, max_bytes: int = 32768) -> dict | None:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length > max_bytes:
+                self.send_json({"error": "请求内容过大"}, 413)
+                return None
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(payload, dict):
+                raise ValueError("JSON 必须是对象")
+            return payload
+        except (ValueError, json.JSONDecodeError):
+            self.send_json({"error": "请求格式无效"}, 400)
+            return None
+
+    def update_proxies(self) -> None:
+        payload = self.read_post_json()
+        if payload is None:
+            return
+        action = payload.get("action")
+        with proxy_lock:
+            settings = load_proxy_settings()
+            proxies = [value for value in settings["proxies"] if isinstance(value, str)]
+            if action == "add":
+                raw_values = payload.get("proxies", "")
+                if not isinstance(raw_values, str):
+                    self.send_json({"error": "代理列表必须是文本"}, 400)
+                    return
+                try:
+                    from goodstack_batch_verify import ProxyRotator
+                    additions = [ProxyRotator.normalise_proxy(line) for line in raw_values.splitlines() if line.strip()]
+                    for value in additions:
+                        parsed = urllib.parse.urlsplit(value)
+                        if not parsed.hostname or not parsed.port or not 1 <= parsed.port <= 65535:
+                            raise ValueError("代理地址必须包含有效主机名和端口")
+                except Exception as exc:
+                    self.send_json({"error": str(exc)[:180]}, 400)
+                    return
+                proxies = list(dict.fromkeys(proxies + additions))
+                if len(proxies) > 100:
+                    self.send_json({"error": "最多保存 100 个代理"}, 400)
+                    return
+            elif action == "remove":
+                remove_id = str(payload.get("id", ""))
+                proxies = [value for value in proxies if proxy_id(value) != remove_id]
+            elif action == "enabled":
+                settings["enabled"] = bool(payload.get("enabled"))
+            else:
+                self.send_json({"error": "无效操作"}, 400)
+            settings["proxies"] = proxies
+            DATA.mkdir(parents=True, exist_ok=True)
+            temporary = PROXY_CONFIG.with_suffix(".tmp")
+            temporary.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.chmod(temporary, 0o600)
+            temporary.replace(PROXY_CONFIG)
+        self.send_json({"saved": True, "count": len(proxies), "enabled": settings["enabled"]})
+
+    def proxy_test(self) -> None:
+        payload = self.read_post_json(4096)
+        if payload is None:
+            return
+        settings = load_proxy_settings()
+        target = next((value for value in settings["proxies"] if isinstance(value, str) and proxy_id(value) == str(payload.get("id", ""))), None)
+        if target is None:
+            self.send_json({"error": "代理不存在，请刷新列表"}, 404)
+            return
+        self.send_json(test_proxy(target))
 
     def start_worker(self):
         global worker

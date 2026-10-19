@@ -20,7 +20,9 @@ git clone https://github.com/zijin-c/goodstack-server-checker.git && cd goodstac
 
 ## 动态代理
 
-首次运行时可选择代理商轮换网关、代理池列表 API，或直连。支持 HTTP(S) 代理；代理池列表可为纯文本或常见 JSON 格式。动态代理需要你已有代理服务的地址/令牌；仓库不含代理凭据，也不会尝试绕过 Goodstack 的真人验证。若出现验证码，程序会停止并保留断点，等待人工处理。
+首次运行时可选择代理商轮换网关、代理池列表 API，或直连。部署后也可直接在网页控制台的“动态代理”区域逐行添加 HTTP(S) 代理、开关代理、删除代理，并点击“检测 IP”查看代理当前出口 IP 和响应耗时。任务会按列表顺序轮换代理；单个轮换网关也可由代理服务商自行轮换出口。代理配置保存在 `data/proxy_settings.json`，仅返回脱敏地址到网页，账号密码文件权限限制为 600。代理地址支持 `http://user:password@host:port`、`http://host:port` 和 `host:port:user:password`。代理商网关/List API 的旧部署配置仍可继续使用。
+
+代理 IP 检测通过代理访问 `https://api.ipify.org`，需确保 VPS 和代理都能访问该地址。仓库不含代理凭据，也不会尝试绕过 Goodstack 的真人验证。若出现验证码，程序会停止并保留断点，等待人工处理。
 
 ## 输出
 
