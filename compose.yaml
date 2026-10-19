@@ -10,4 +10,4 @@ services:
       - --output-dir
       - /data/results
       - --delay
-      - "1.0"
+      - "2.0"

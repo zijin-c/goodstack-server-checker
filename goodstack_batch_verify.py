@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Read-only Goodstack organisation search for the provided charity list.
+"""Search Goodstack's public claim page with Chromium and save visible evidence.
 
-Uses Goodstack's documented GET /v1/organisations endpoint. It never claims,
-creates, edits, or submits organisations.
+The script operates the public web form. It does not make direct API calls,
+create organisations, claim profiles, or submit any claim/application forms.
+When the page itself loads a search result, its browser response is observed
+to retain createdAt/claimedAt fields that are not rendered in the visible card.
 """
 from __future__ import annotations
 
@@ -21,109 +23,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-API_URL = os.getenv("GOODSTACK_API_URL", "https://api.goodstack.io/v1/organisations")
-USER_AGENT = "GoodstackReadOnlyBatchChecker/1.0"
+SEARCH_URL = "https://causes.goodstack.io/claim?utm_source=goodstack_org"
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+BLOCK_RE = re.compile(r"verify you are human|checking your browser|unusual traffic|automated queries|验证您是真人|人机验证", re.I)
+ERROR_RE = re.compile(r"unknown error|an error occurred|something went wrong|请刷新页面重试|请求失败|查询失败", re.I)
+EMPTY_RE = re.compile(r"未找到组织|未找到任何组织|没有找到任何组织|没有匹配的组织|no (?:organizations?|organisations?|results) found|organization not found|organisation not found|0 个结果|0 results", re.I)
+JOIN_RE = re.compile(r"申请加入|apply to join|request to join", re.I)
+CLAIMED_RE = re.compile(r"已认领|已有管理员|已由管理员管理|claimed by|managed by an admin|has an admin", re.I)
+CLAIM_ACTION_RE = re.compile(r"认领组织|claim organization|claim this organization", re.I)
+COUNT_RE = re.compile(r"(?:找到|发现)\s*(\d+)\s*(?:个)?组织|(?:showing|found)\s*(\d+)\s*(?:organizations?|organisations?)|\b(\d+)\s*results?\b", re.I)
 
 
-class ApiError(RuntimeError):
-    def __init__(self, message: str, status: int | None = None):
-        super().__init__(message)
-        self.status = status
-
-
-class ProxyRotator:
-    """Optional HTTP(S) proxy gateway or rotating list supplied by the operator."""
-    def __init__(self) -> None:
-        self.gateway = os.getenv("GOODSTACK_PROXY_URL", "").strip()
-        self.list_url = os.getenv("GOODSTACK_PROXY_LIST_URL", "").strip()
-        self.token = os.getenv("GOODSTACK_PROXY_TOKEN", "").strip()
-        self.refresh_seconds = max(30, int(os.getenv("GOODSTACK_PROXY_REFRESH_SECONDS", "300")))
-        self.proxies: list[str] = []
-        self.refreshed_at = 0.0
-        self.position = 0
-        if self.gateway and self.list_url:
-            raise ApiError("GOODSTACK_PROXY_URL 与 GOODSTACK_PROXY_LIST_URL 只能配置一个")
-
-    @property
-    def mode(self) -> str:
-        if self.gateway:
-            return "rotating_gateway"
-        if self.list_url:
-            return "downloaded_proxy_pool"
-        return "direct"
-
-    @staticmethod
-    def _normalise_proxy(value: str) -> str:
-        value = value.strip().strip("\"'")
-        if not value:
-            return ""
-        if re.match(r"^[^:/\s]+:\d+:[^:\s]+:.+$", value):
-            host, port, username, password = value.split(":", 3)
-            value = f"http://{urllib.parse.quote(username)}:{urllib.parse.quote(password)}@{host}:{port}"
-        elif "://" not in value:
-            value = "http://" + value
-        scheme = urllib.parse.urlsplit(value).scheme.lower()
-        if scheme not in {"http", "https"}:
-            raise ApiError("动态代理只支持 HTTP/HTTPS 代理；SOCKS 代理请换用 HTTP(S) 接口")
-        return value
-
-    @classmethod
-    def _extract_proxies(cls, payload: Any) -> list[str]:
-        found: list[str] = []
-        def walk(value: Any) -> None:
-            if isinstance(value, str):
-                for line in value.splitlines():
-                    candidate = cls._normalise_proxy(line)
-                    if candidate:
-                        found.append(candidate)
-            elif isinstance(value, list):
-                for item in value:
-                    walk(item)
-            elif isinstance(value, dict):
-                if value.get("ip") and value.get("port"):
-                    host, port = str(value["ip"]), str(value["port"])
-                    user, password = str(value.get("username") or ""), str(value.get("password") or "")
-                    auth = f"{urllib.parse.quote(user)}:{urllib.parse.quote(password)}@" if user else ""
-                    found.append(f"http://{auth}{host}:{port}")
-                else:
-                    for key in ("data", "proxies", "proxy", "result", "list", "items"):
-                        if key in value:
-                            walk(value[key])
-        walk(payload)
-        return list(dict.fromkeys(found))
-
-    def _refresh(self) -> None:
-        headers = {"Accept": "application/json,text/plain,*/*", "User-Agent": USER_AGENT}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        request = urllib.request.Request(self.list_url, headers=headers)
-        try:
-            with urllib.request.urlopen(request, timeout=20) as response:
-                body = response.read().decode("utf-8", "replace")
-            try:
-                payload: Any = json.loads(body)
-            except json.JSONDecodeError:
-                payload = body
-            proxies = self._extract_proxies(payload)
-            if not proxies:
-                raise ApiError("代理服务返回内容中没有可识别的 HTTP(S) 代理")
-            self.proxies = proxies
-            self.refreshed_at = time.monotonic()
-            self.position = 0
-            print(f"动态代理池已更新：{len(proxies)} 个代理")
-        except (urllib.error.URLError, TimeoutError, ApiError) as exc:
-            raise ApiError(f"获取动态代理失败：{exc}") from exc
-
-    def next_proxy(self) -> str:
-        if self.gateway:
-            return self._normalise_proxy(self.gateway)
-        if not self.list_url:
-            return ""
-        if not self.proxies or time.monotonic() - self.refreshed_at >= self.refresh_seconds:
-            self._refresh()
-        proxy = self.proxies[self.position % len(self.proxies)]
-        self.position += 1
-        return proxy
+class SearchError(RuntimeError):
+    pass
 
 
 def get(row: dict[str, Any], *keys: str) -> str:
@@ -157,6 +69,109 @@ def host_of(value: str) -> str:
         return ""
 
 
+class ProxyRotator:
+    """Optional provider gateway or list of HTTP(S) proxies for browser contexts."""
+
+    def __init__(self) -> None:
+        self.gateway = os.getenv("GOODSTACK_PROXY_URL", "").strip()
+        self.list_url = os.getenv("GOODSTACK_PROXY_LIST_URL", "").strip()
+        self.token = os.getenv("GOODSTACK_PROXY_TOKEN", "").strip()
+        self.refresh_seconds = max(30, int(os.getenv("GOODSTACK_PROXY_REFRESH_SECONDS", "300")))
+        self.proxies: list[str] = []
+        self.refreshed_at = 0.0
+        self.position = 0
+        if self.gateway and self.list_url:
+            raise SearchError("GOODSTACK_PROXY_URL 与 GOODSTACK_PROXY_LIST_URL 只能配置一个")
+
+    @property
+    def mode(self) -> str:
+        if self.gateway:
+            return "rotating_gateway"
+        if self.list_url:
+            return "downloaded_proxy_pool"
+        return "direct"
+
+    @staticmethod
+    def normalise_proxy(value: str) -> str:
+        value = value.strip().strip("\"'")
+        if not value:
+            return ""
+        if re.match(r"^[^:/\s]+:\d+:[^:\s]+:.+$", value):
+            host, port, username, password = value.split(":", 3)
+            value = f"http://{urllib.parse.quote(username)}:{urllib.parse.quote(password)}@{host}:{port}"
+        elif "://" not in value:
+            value = "http://" + value
+        if urllib.parse.urlsplit(value).scheme.lower() not in {"http", "https"}:
+            raise SearchError("代理只支持 HTTP/HTTPS；SOCKS 代理当前不支持")
+        return value
+
+    @classmethod
+    def extract(cls, payload: Any) -> list[str]:
+        values: list[str] = []
+
+        def walk(value: Any) -> None:
+            if isinstance(value, str):
+                values.extend(cls.normalise_proxy(line) for line in value.splitlines() if line.strip())
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+            elif isinstance(value, dict):
+                if value.get("ip") and value.get("port"):
+                    user = urllib.parse.quote(str(value.get("username") or ""))
+                    password = urllib.parse.quote(str(value.get("password") or ""))
+                    auth = f"{user}:{password}@" if user else ""
+                    values.append(f"http://{auth}{value['ip']}:{value['port']}")
+                else:
+                    for key in ("data", "proxies", "proxy", "result", "list", "items"):
+                        if key in value:
+                            walk(value[key])
+
+        walk(payload)
+        return list(dict.fromkeys(value for value in values if value))
+
+    def refresh(self) -> None:
+        headers = {"Accept": "application/json,text/plain,*/*", "User-Agent": USER_AGENT}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        request = urllib.request.Request(self.list_url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                body = response.read().decode("utf-8", "replace")
+            try:
+                payload: Any = json.loads(body)
+            except json.JSONDecodeError:
+                payload = body
+            proxies = self.extract(payload)
+            if not proxies:
+                raise SearchError("代理池响应中没有可识别的 HTTP(S) 代理")
+            self.proxies = proxies
+            self.refreshed_at = time.monotonic()
+            self.position = 0
+            print(f"代理池已更新：{len(proxies)} 个代理")
+        except (urllib.error.URLError, TimeoutError, SearchError) as exc:
+            raise SearchError(f"获取代理列表失败：{exc}") from exc
+
+    def next_proxy(self) -> dict[str, str] | None:
+        if self.gateway:
+            raw = self.normalise_proxy(self.gateway)
+        elif self.list_url:
+            if not self.proxies or time.monotonic() - self.refreshed_at >= self.refresh_seconds:
+                self.refresh()
+            raw = self.proxies[self.position % len(self.proxies)]
+            self.position += 1
+        else:
+            return None
+        parsed = urllib.parse.urlsplit(raw)
+        server = f"{parsed.scheme}://{parsed.hostname}"
+        if parsed.port:
+            server += f":{parsed.port}"
+        result = {"server": server}
+        if parsed.username:
+            result["username"] = urllib.parse.unquote(parsed.username)
+            result["password"] = urllib.parse.unquote(parsed.password or "")
+        return result
+
+
 def load_records(path: Path) -> list[dict[str, Any]]:
     if path.suffix.lower() == ".csv":
         with path.open("r", encoding="utf-8-sig", newline="") as stream:
@@ -184,8 +199,6 @@ def prepare_targets(records: list[dict[str, Any]], country_code: str) -> list[di
         registration = get(row, "CRA登记号", "registrationNumber", "registryId")
         domain = host_of(get(row, "主机名", "官网登记原始网址", "规范化官网", "website", "domain"))
         detected_domain = get(row, "检测域名", "detectedDomain")
-        raw_country = get(row, "countryCode") or get(row, "国家/地区") or country_code
-        country = {"canada": "CAN"}.get(raw_country.casefold(), raw_country.upper() if len(raw_country) == 3 else country_code)
         if not name and not registration:
             continue
         key = normalise_reg(registration) or f"{normalise(name)}|{domain or normalise(detected_domain)}"
@@ -193,95 +206,66 @@ def prepare_targets(records: list[dict[str, Any]], country_code: str) -> list[di
             continue
         seen.add(key)
         targets.append({
-            "inputKey": key,
-            "inputName": name or legal_name,
-            "legalName": legal_name,
-            "registrationNumber": registration,
-            "countryCode": country,
+            "inputKey": key, "inputName": name or legal_name, "legalName": legal_name,
+            "registrationNumber": registration, "countryCode": country_code,
             "officialWebsite": get(row, "规范化官网", "官网登记原始网址", "website"),
-            "officialDomain": domain,
-            "detectedDomain": detected_domain,
-            "sourceRecord": row,
+            "officialDomain": domain, "detectedDomain": detected_domain, "sourceRecord": row,
         })
     return targets
 
 
-class GoodstackClient:
-    def __init__(self, api_key: str, min_delay: float, retries: int, proxy: ProxyRotator):
-        self.api_key = api_key
-        self.min_delay = min_delay
-        self.retries = retries
-        self.proxy = proxy
-        self.last_request = 0.0
+def visible_results(text: str) -> dict[str, Any]:
+    count_match = COUNT_RE.search(text)
+    result_count = next((int(x) for x in count_match.groups() if x), None) if count_match else None
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
+    records = []
+    for index, line in enumerate(lines):
+        if not re.search(r"^(?:地址|address)$", line, re.I):
+            continue
+        name = lines[index - 1] if index else ""
+        address = lines[index + 1] if index + 1 < len(lines) else ""
+        reg_no = ""
+        for pos in range(index + 2, min(index + 5, len(lines))):
+            if re.search(r"^(?:注册编号|登记编号|registration (?:number|no\.?|#)|registry number)$", lines[pos], re.I):
+                reg_no = lines[pos + 1] if pos + 1 < len(lines) else ""
+                break
+        if name and name.casefold() not in {"地址", "address"}:
+            card_text = " ".join(lines[index - 1:min(len(lines), index + 5)])
+            records.append({
+                "name": name,
+                "address": "" if re.search(r"无地址信息|no address", address, re.I) else address,
+                "registryId": reg_no,
+                "statusHint": "apply_to_join" if JOIN_RE.search(card_text) else "claimed_hint" if CLAIMED_RE.search(card_text) else "claim_action" if CLAIM_ACTION_RE.search(card_text) else "",
+                "source": "visible_page",
+            })
+    return {"resultCount": result_count, "results": records}
 
-    def _wait_turn(self) -> None:
-        remaining = self.min_delay - (time.monotonic() - self.last_request)
-        if remaining > 0:
-            time.sleep(remaining)
-        self.last_request = time.monotonic()
 
-    def search(self, params: dict[str, str], page_cap: int = 10) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        collected: list[dict[str, Any]] = []
-        requests: list[dict[str, Any]] = []
-        for page in range(1, page_cap + 1):
-            query = dict(params)
-            query.update({"page": str(page), "pageSize": "100"})
-            url = API_URL + "?" + urllib.parse.urlencode(query)
-            last_error: Exception | None = None
-            for attempt in range(self.retries + 1):
-                self._wait_turn()
-                proxy_url = self.proxy.next_proxy()
-                opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-                ) if proxy_url else urllib.request.build_opener()
-                request = urllib.request.Request(url, headers={
-                    "Authorization": self.api_key,
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "User-Agent": USER_AGENT,
-                })
-                try:
-                    with opener.open(request, timeout=30) as response:
-                        status = response.status
-                        body = response.read()
-                    requests.append({"url": url, "httpStatus": status, "proxyMode": self.proxy.mode})
-                    payload = json.loads(body.decode("utf-8")) if body else {}
-                    if status >= 400:
-                        raise ApiError(f"Goodstack HTTP {status}", status)
-                    if not isinstance(payload, dict) or not isinstance(payload.get("data", []), list):
-                        raise ApiError("Goodstack 返回格式不符合预期")
-                    page_rows = payload.get("data", [])
-                    collected.extend(item for item in page_rows if isinstance(item, dict))
-                    if not page_rows or not payload.get("_links", {}).get("next"):
-                        return collected, requests
-                    last_error = None
-                    break
-                except urllib.error.HTTPError as exc:
-                    body = exc.read(2000).decode("utf-8", "replace")
-                    requests.append({"url": url, "httpStatus": exc.code, "proxyMode": self.proxy.mode})
-                    if exc.code in (401, 403):
-                        raise ApiError(f"Goodstack HTTP {exc.code}: API key 无效或无此接口权限；{body[:500]}", exc.code) from exc
-                    if exc.code not in (429, 500, 502, 503, 504) or attempt >= self.retries:
-                        raise ApiError(f"Goodstack HTTP {exc.code}: {body[:500]}", exc.code) from exc
-                    retry_after = exc.headers.get("Retry-After", "")
-                    try:
-                        wait = max(float(retry_after), min(60.0, 2.0 ** attempt))
-                    except ValueError:
-                        wait = min(60.0, 2.0 ** attempt)
-                    time.sleep(wait)
-                    last_error = exc
-                except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ApiError) as exc:
-                    if isinstance(exc, ApiError) and exc.status in (401, 403):
-                        raise
-                    if isinstance(exc, ApiError) and exc.status is not None and exc.status not in (429, 500, 502, 503, 504):
-                        raise
-                    if attempt >= self.retries:
-                        raise ApiError(str(exc), getattr(exc, "status", None)) from exc
-                    time.sleep(min(60.0, 2.0 ** attempt))
-                    last_error = exc
-            if last_error:
-                raise ApiError(str(last_error))
-        return collected, requests
+def extract_browser_payload(response: Any) -> list[dict[str, Any]]:
+    """Observe only the response generated by the page's own public search form."""
+    try:
+        payload = response.json()
+    except Exception:
+        return []
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return []
+    rows = []
+    for item in payload["data"]:
+        if not isinstance(item, dict):
+            continue
+        rows.append({
+            "id": item.get("id", ""), "name": item.get("name", ""),
+            "displayName": item.get("displayName", ""), "countryCode": item.get("countryCode", ""),
+            "registryName": item.get("registry", {}).get("englishName", "") if isinstance(item.get("registry"), dict) else "",
+            "registryId": item.get("registryId", ""), "website": item.get("website", ""),
+            "websites": item.get("websites", []), "address": item.get("address", ""),
+            "addressLine1": item.get("addressLine1", ""), "addressLine2": item.get("addressLine2", ""),
+            "city": item.get("city", ""), "state": item.get("state", ""), "postcode": item.get("postcode", ""),
+            "registrationDate": item.get("registrationDate", ""),
+            "createdAt": item.get("createdAt", ""), "claimedAt": item.get("claimedAt", ""),
+            "source": "browser_page_search_response",
+        })
+    return rows
 
 
 def candidate_grade(target: dict[str, Any], candidate: dict[str, Any]) -> str:
@@ -298,126 +282,194 @@ def candidate_grade(target: dict[str, Any], candidate: dict[str, Any]) -> str:
     if target_domain and target_domain in candidate_hosts:
         return "website_domain_exact"
     target_names = {normalise(target.get("inputName", "")), normalise(target.get("legalName", ""))} - {""}
-    candidate_names = {normalise(str(candidate.get(k) or "")) for k in ("name", "displayName")} - {""}
+    candidate_names = {normalise(str(candidate.get(key) or "")) for key in ("name", "displayName")} - {""}
     if target_names & candidate_names:
         return "name_exact"
     return "review_candidate"
 
 
-def make_queries(target: dict[str, Any]) -> list[tuple[str, dict[str, str]]]:
-    base = {"countryCode": target.get("countryCode") or "CAN"}
-    queries: list[tuple[str, dict[str, str]]] = []
-    reg = target.get("registrationNumber", "")
-    if reg:
-        queries.append(("registryId", {**base, "registryId": reg}))
-    for label, name in (("publicName", target.get("inputName", "")), ("legalName", target.get("legalName", ""))):
-        if name and all(normalise(name) != normalise(q[1].get("query", "")) for q in queries if "query" in q[1]):
-            queries.append((label, {**base, "query": name}))
-    if target.get("officialDomain"):
-        queries.append(("officialDomain", {**base, "domain": target["officialDomain"]}))
-    return queries
+def classify_visible(text: str, name: str, parsed: dict[str, Any]) -> tuple[str, str]:
+    if BLOCK_RE.search(text):
+        return "browser_challenge", "页面要求真人验证；已停止自动搜索，不自动处理验证"
+    if ERROR_RE.search(text):
+        return "query_error", "Goodstack 页面显示查询错误，不能据此判断是否收录"
+    exact_cards = [row for row in parsed["results"] if normalise(row["name"]) == normalise(name)]
+    if exact_cards and any(row["statusHint"] == "claimed_hint" for row in exact_cards):
+        return "visible_claimed_hint", "页面文字明确提示已认领或已有管理员，请人工确认"
+    if exact_cards and any(row["statusHint"] == "apply_to_join" for row in exact_cards):
+        return "visible_apply_to_join", "页面显示申请加入入口；脚本不会点击或提交"
+    if exact_cards:
+        return "visible_exact_result", "页面显示同名结果；仍需对照登记编号确认"
+    if EMPTY_RE.search(text) or parsed["resultCount"] == 0:
+        return "not_found_on_page", "页面明确显示无结果；仅代表本次公开名称搜索"
+    if parsed["resultCount"] is not None and parsed["resultCount"] > 0:
+        return "candidates_need_review", f"页面返回 {parsed['resultCount']} 个候选，但没有完全同名卡片"
+    return "query_error", "未能从页面识别出搜索完成状态，不能判断是否收录"
 
 
-def check_target(client: GoodstackClient, target: dict[str, Any], page_cap: int) -> dict[str, Any]:
-    by_id: dict[str, dict[str, Any]] = {}
-    query_log: list[dict[str, Any]] = []
-    query_errors: list[str] = []
-    for method, params in make_queries(target):
-        try:
-            rows, requests = client.search(params, page_cap=page_cap)
-            query_log.extend({"method": method, **item} for item in requests)
-            for candidate in rows:
-                identifier = str(candidate.get("id") or json.dumps(candidate, sort_keys=True, ensure_ascii=False))
-                by_id[identifier] = candidate
-            # Stop as soon as an exact identifier, domain, or name match is found.
-            # This keeps the batch small while still falling back across aliases.
-            if any(candidate_grade(target, row) != "review_candidate" for row in rows):
-                break
-        except ApiError as exc:
-            query_errors.append(f"{method}: {exc}")
-            if exc.status in (401, 403):
-                raise
-    candidates = []
-    for candidate in by_id.values():
-        candidates.append({"matchGrade": candidate_grade(target, candidate), "bothDatesPresent": bool(candidate.get("createdAt") and candidate.get("claimedAt")), "organisation": candidate})
-    candidates.sort(key=lambda item: (item["matchGrade"] == "review_candidate", not item["bothDatesPresent"], str(item["organisation"].get("name") or "").casefold()))
-    exact = [item for item in candidates if item["matchGrade"] != "review_candidate"]
-    both = [item for item in candidates if item["bothDatesPresent"]]
-    if exact and any(item["bothDatesPresent"] for item in exact):
-        status = "exact_match_both_dates"
-    elif exact:
-        status = "exact_match_dates_incomplete"
-    elif candidates:
-        status = "candidates_need_review"
-    elif query_errors:
-        status = "query_error"
+def configure_country(page: Any, country_name: str) -> None:
+    country = page.locator('input[id^="headlessui-combobox-input-"]').first
+    if not country.count():
+        country = page.get_by_role("combobox").first
+    current = country.input_value().strip()
+    if current.casefold() == country_name.casefold():
+        return
+    country.fill(country_name)
+    option = page.get_by_role("option", name=re.compile(re.escape(country_name), re.I)).first
+    if option.count():
+        option.click()
     else:
-        status = "not_found"
-    return {
-        "inputKey": target["inputKey"],
-        "inputName": target["inputName"],
-        "legalName": target["legalName"],
-        "registrationNumber": target["registrationNumber"],
-        "countryCode": target["countryCode"],
-        "officialWebsite": target["officialWebsite"],
-        "officialDomain": target["officialDomain"],
-        "detectedDomain": target["detectedDomain"],
-        "status": status,
-        "candidateCount": len(candidates),
-        "exactCandidateCount": len(exact),
-        "bothDatesCandidateCount": len(both),
-        "candidates": candidates,
-        "queryLog": query_log,
-        "errors": query_errors,
-        "checkedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "sourceRecord": target["sourceRecord"],
-    }
+        page.get_by_text(country_name, exact=True).last.click()
+    if country.input_value().strip().casefold() != country_name.casefold():
+        raise SearchError(f"国家选择框未确认选中 {country_name}")
+
+
+def search_once(page: Any, query_name: str, delay: float, browser_payloads: list[dict[str, Any]], browser_statuses: list[int]) -> tuple[dict[str, Any], str, int]:
+    configure_country(page, "Canada")
+    name_input = page.get_by_role("textbox", name=re.compile(r"组织名称|organization name|organisation name", re.I)).first
+    if not name_input.count():
+        name_input = page.locator('input:visible:not([id^="headlessui-combobox-input-"]):not([type="hidden"]):not([type="checkbox"]):not([type="radio"])').first
+    search = page.get_by_role("button", name=re.compile(r"^(搜索|Search)$", re.I)).first
+    name_input.fill(query_name)
+    baseline_text = page.locator("body").inner_text()
+    browser_payloads.clear()
+    browser_statuses.clear()
+    search.click()
+    deadline = time.monotonic() + 30
+    status_code = 0
+    while time.monotonic() < deadline:
+        page.wait_for_timeout(500)
+        if browser_statuses:
+            status_code = browser_statuses[-1]
+            break
+        text = page.locator("body").inner_text()
+        if text != baseline_text and (BLOCK_RE.search(text) or ERROR_RE.search(text) or EMPTY_RE.search(text)):
+            status_code = 200
+            break
+    if status_code == 0 and not browser_payloads:
+        raise SearchError("等待网页搜索结果超时或浏览器未收到有效结果")
+    if delay > 0:
+        time.sleep(delay)
+    visible = visible_results(page.locator("body").inner_text())
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    for row in browser_payloads:
+        rows_by_id[str(row.get("id") or json.dumps(row, sort_keys=True, ensure_ascii=False))] = row
+    for row in visible["results"]:
+        rows_by_id.setdefault(f"visible:{row['name']}:{row['registryId']}", row)
+    return visible, page.locator("body").inner_text(), status_code
+
+
+def check_target(browser: Any, proxy: ProxyRotator, target: dict[str, Any], delay: float, timeout: int) -> dict[str, Any]:
+    context_options: dict[str, Any] = {"locale": "zh-CN", "viewport": {"width": 1365, "height": 900}, "user_agent": USER_AGENT}
+    browser_proxy = proxy.next_proxy()
+    if browser_proxy:
+        context_options["proxy"] = browser_proxy
+    context = browser.new_context(**context_options)
+    page = context.new_page()
+    page.set_default_timeout(timeout * 1000)
+    seen_payloads: list[dict[str, Any]] = []
+    browser_statuses: list[int] = []
+    response_errors: list[str] = []
+
+    def observe_response(response: Any) -> None:
+        # The browser's public form initiates this request; the script never issues it.
+        if "/v1/organisations" not in response.url or response.request.method.upper() != "GET":
+            return
+        browser_statuses.append(response.status)
+        if response.status >= 400:
+            response_errors.append(f"浏览器搜索响应 HTTP {response.status}")
+            return
+        seen_payloads.extend(extract_browser_payload(response))
+
+    page.on("response", observe_response)
+    try:
+        page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=timeout * 1000)
+        # Goodstack page defaults to Canada in its public search form.
+        queries = [target["inputName"]] if target["inputName"] else []
+        if target.get("legalName") and normalise(target["legalName"]) != normalise(target["inputName"]):
+            queries.append(target["legalName"])
+        if not queries and target.get("registrationNumber"):
+            queries.append(target["registrationNumber"])
+        merged_visible: list[dict[str, Any]] = []
+        full_text = ""
+        for query_name in queries:
+            visible, text, _ = search_once(page, query_name, delay, seen_payloads, browser_statuses)
+            merged_visible.extend(visible["results"])
+            full_text = text
+            if BLOCK_RE.search(text) or ERROR_RE.search(text):
+                break
+            candidates = list(seen_payloads) + merged_visible
+            if any(candidate_grade(target, row) != "review_candidate" for row in candidates):
+                break
+        visible = {"results": merged_visible, "resultCount": visible.get("resultCount")}
+        by_id: dict[str, dict[str, Any]] = {}
+        for row in seen_payloads + merged_visible:
+            identifier = str(row.get("id") or f"{row.get('name')}|{row.get('registryId')}")
+            by_id[identifier] = row
+        candidates = [{"matchGrade": candidate_grade(target, row), "bothDatesPresent": bool(row.get("createdAt") and row.get("claimedAt")), "organisation": row} for row in by_id.values()]
+        candidates.sort(key=lambda item: (item["matchGrade"] == "review_candidate", not item["bothDatesPresent"], str(item["organisation"].get("name") or "").casefold()))
+        status, detail = classify_visible(full_text, target["inputName"], visible)
+        exact = [item for item in candidates if item["matchGrade"] != "review_candidate"]
+        both = [item for item in exact if item["bothDatesPresent"]]
+        if response_errors:
+            status, detail = "query_error", "; ".join(response_errors)
+        elif status not in {"browser_challenge", "query_error"}:
+            if exact and both:
+                status, detail = "exact_match_both_dates", "浏览器搜索精确匹配，页面搜索结果包含 createdAt 与 claimedAt"
+            elif exact:
+                status, detail = "exact_match_dates_incomplete", "浏览器搜索精确匹配，但加载的结果没有同时提供两个日期字段"
+            elif candidates:
+                status, detail = "candidates_need_review", "浏览器搜索返回候选，但未与名单信息精确匹配"
+        return {
+            "inputKey": target["inputKey"], "inputName": target["inputName"], "legalName": target["legalName"],
+            "registrationNumber": target["registrationNumber"], "countryCode": target["countryCode"],
+            "officialWebsite": target["officialWebsite"], "officialDomain": target["officialDomain"],
+            "detectedDomain": target["detectedDomain"], "status": status, "detail": detail,
+            "visibleResultCount": visible.get("resultCount"), "visibleResults": merged_visible,
+            "candidateCount": len(candidates), "exactCandidateCount": len(exact),
+            "bothDatesCandidateCount": len(both), "candidates": candidates,
+            "searchMethod": "chromium_public_page", "proxyMode": proxy.mode,
+            "errors": response_errors, "checkedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "sourceRecord": target["sourceRecord"],
+        }
+    finally:
+        context.close()
 
 
 def save_outputs(out_dir: Path, checkpoint: Path, input_count: int) -> None:
-    latest_by_key: dict[str, dict[str, Any]] = {}
+    latest: dict[str, dict[str, Any]] = {}
     if checkpoint.exists():
         with checkpoint.open("r", encoding="utf-8") as stream:
             for line in stream:
-                if line.strip():
-                    try:
-                        item = json.loads(line)
-                        if item.get("inputKey"):
-                            latest_by_key[item["inputKey"]] = item
-                    except json.JSONDecodeError:
-                        continue
-    results = list(latest_by_key.values())
-    results.sort(key=lambda row: (row.get("inputName", "").casefold(), row.get("inputKey", "")))
-    both_date_rows = []
+                try:
+                    row = json.loads(line)
+                    if row.get("inputKey"):
+                        latest[row["inputKey"]] = row
+                except json.JSONDecodeError:
+                    continue
+    results = sorted(latest.values(), key=lambda row: (row.get("inputName", "").casefold(), row.get("inputKey", "")))
+    both_rows = []
     for result in results:
         for candidate in result.get("candidates", []):
             org = candidate.get("organisation", {})
-            if org.get("createdAt") and org.get("claimedAt"):
-                both_date_rows.append({
-                    "target": {key: result.get(key) for key in ("inputName", "legalName", "registrationNumber", "officialDomain", "detectedDomain")},
-                    "matchGrade": candidate.get("matchGrade"),
-                    "createdAt": org.get("createdAt"),
-                    "claimedAt": org.get("claimedAt"),
-                    "organisation": org,
-                })
+            if candidate.get("matchGrade") != "review_candidate" and org.get("createdAt") and org.get("claimedAt"):
+                both_rows.append({"target": {key: result.get(key) for key in ("inputName", "legalName", "registrationNumber", "officialDomain", "detectedDomain")}, "matchGrade": candidate["matchGrade"], "createdAt": org["createdAt"], "claimedAt": org["claimedAt"], "organisation": org})
     summary = {
-        "generatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "inputRecordCount": input_count,
-        "processedRecordCount": len(results),
-        "exactMatchCount": sum(1 for row in results if row.get("exactCandidateCount", 0)),
-        "exactMatchWithBothDatesCount": sum(1 for row in results if row.get("status") == "exact_match_both_dates"),
-        "needsReviewCount": sum(1 for row in results if row.get("status") == "candidates_need_review"),
-        "notFoundCount": sum(1 for row in results if row.get("status") == "not_found"),
-        "queryErrorCount": sum(1 for row in results if row.get("status") == "query_error"),
-        "bothDatesCandidateCount": len(both_date_rows),
-        "dateFields": ["createdAt", "claimedAt"],
-        "results": "results.jsonl",
-        "bothDatesResults": "both_dates.json",
+        "generatedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "inputRecordCount": input_count,
+        "processedRecordCount": len(results), "exactMatchCount": sum(bool(r.get("exactCandidateCount")) for r in results),
+        "exactMatchWithBothDatesCount": sum(r.get("status") == "exact_match_both_dates" for r in results),
+        "visiblePageMatchCount": sum(r.get("status", "").startswith("visible_") for r in results),
+        "needsReviewCount": sum(r.get("status") == "candidates_need_review" for r in results),
+        "notFoundCount": sum(r.get("status") == "not_found_on_page" for r in results),
+        "queryErrorCount": sum(r.get("status") in {"query_error", "browser_challenge"} for r in results),
+        "bothDatesCandidateCount": len(both_rows), "dateFields": ["createdAt", "claimedAt"],
+        "method": "Playwright Chromium operating Goodstack public search page; no direct API requests",
+        "results": "results.jsonl", "bothDatesResults": "both_dates.json",
     }
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "both_dates.json").write_text(json.dumps({"summary": summary, "results": both_date_rows}, ensure_ascii=False, indent=2), encoding="utf-8")
+    (out_dir / "both_dates.json").write_text(json.dumps({"summary": summary, "results": both_rows}, ensure_ascii=False, indent=2), encoding="utf-8")
     (out_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    fields = ["inputName", "legalName", "registrationNumber", "countryCode", "officialDomain", "detectedDomain", "status", "candidateCount", "exactCandidateCount", "bothDatesCandidateCount", "matchedNames", "matchedIds", "matchedCreatedAt", "matchedClaimedAt", "checkedAt", "errors"]
+    fields = ["inputName", "legalName", "registrationNumber", "countryCode", "officialDomain", "detectedDomain", "status", "visibleResultCount", "candidateCount", "exactCandidateCount", "bothDatesCandidateCount", "matchedNames", "matchedIds", "matchedCreatedAt", "matchedClaimedAt", "checkedAt", "errors"]
     with (out_dir / "summary.csv").open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
@@ -425,35 +477,31 @@ def save_outputs(out_dir: Path, checkpoint: Path, input_count: int) -> None:
             exact = [c["organisation"] for c in result.get("candidates", []) if c.get("matchGrade") != "review_candidate"]
             writer.writerow({
                 **{key: result.get(key, "") for key in fields if key in result},
-                "matchedNames": "; ".join(str(item.get("name") or item.get("displayName") or "") for item in exact),
-                "matchedIds": "; ".join(str(item.get("id") or "") for item in exact),
-                "matchedCreatedAt": "; ".join(str(item.get("createdAt") or "") for item in exact),
-                "matchedClaimedAt": "; ".join(str(item.get("claimedAt") or "") for item in exact),
+                "matchedNames": "; ".join(str(x.get("name") or x.get("displayName") or "") for x in exact),
+                "matchedIds": "; ".join(str(x.get("id") or "") for x in exact),
+                "matchedCreatedAt": "; ".join(str(x.get("createdAt") or "") for x in exact),
+                "matchedClaimedAt": "; ".join(str(x.get("claimedAt") or "") for x in exact),
                 "errors": "; ".join(result.get("errors", [])),
             })
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="只读批量查询 Goodstack 机构目录，并筛选 createdAt 和 claimedAt 均有值的结果")
+    parser = argparse.ArgumentParser(description="用 Chromium 自动操作 Goodstack 公开搜索页面批量核验机构")
     parser.add_argument("--input", type=Path, default=Path("/data/input.json"), help="JSON 或 CSV 机构名单")
-    parser.add_argument("--output-dir", type=Path, default=Path("/data/results"), help="结果目录；复用可断点续跑")
-    parser.add_argument("--country-code", default="CAN", help="ISO 三位国家代码，默认 CAN")
-    parser.add_argument("--delay", type=float, default=1.0, help="每次请求最小间隔秒数，默认 1.0")
-    parser.add_argument("--retries", type=int, default=5, help="429/5xx/网络错误重试次数")
-    parser.add_argument("--page-cap", type=int, default=10, help="每个查询最多读取页数，每页 100 条")
-    parser.add_argument("--max-records", type=int, default=0, help="只处理前 N 条；0 表示全部")
-    parser.add_argument("--no-resume", action="store_true", help="忽略已有 checkpoint，重新查询全部")
+    parser.add_argument("--output-dir", type=Path, default=Path("/data/results"), help="输出目录；复用 checkpoint 可续跑")
+    parser.add_argument("--country-code", default="CAN", help="输入数据国家代码，默认 CAN")
+    parser.add_argument("--delay", type=float, default=2.0, help="每次页面搜索后的等待秒数")
+    parser.add_argument("--timeout", type=int, default=45, help="页面加载/搜索超时秒数")
+    parser.add_argument("--max-records", type=int, default=0, help="只处理前 N 家；0 表示全部")
+    parser.add_argument("--no-resume", action="store_true", help="忽略已有 checkpoint")
     args = parser.parse_args()
-    api_key = os.getenv("GOODSTACK_API_KEY", "").strip()
-    if not api_key:
-        parser.error("请先通过环境变量 GOODSTACK_API_KEY 设置 Goodstack API key（pk_ 或 sk_）")
-    if args.delay < 0 or args.retries < 0 or args.page_cap < 1:
-        parser.error("--delay、--retries、--page-cap 参数无效")
+    if args.delay < 0 or args.timeout < 10 or args.max_records < 0:
+        parser.error("--delay、--timeout 或 --max-records 参数无效")
     if not args.input.exists():
         parser.error(f"输入文件不存在：{args.input}")
-    all_records = load_records(args.input)
-    targets = prepare_targets(all_records, args.country_code)
-    if args.max_records > 0:
+    records = load_records(args.input)
+    targets = prepare_targets(records, args.country_code)
+    if args.max_records:
         targets = targets[:args.max_records]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = args.output_dir / "checkpoint.jsonl"
@@ -462,47 +510,56 @@ def main() -> int:
         with checkpoint.open("r", encoding="utf-8") as stream:
             for line in stream:
                 try:
-                    item = json.loads(line)
-                    if item.get("inputKey") and item.get("status") != "query_error":
-                        completed.add(item["inputKey"])
+                    row = json.loads(line)
+                    if row.get("inputKey") and row.get("status") not in {"query_error", "browser_challenge"}:
+                        completed.add(row["inputKey"])
                 except json.JSONDecodeError:
-                    pass
-    pending = [target for target in targets if target["inputKey"] not in completed]
-    print(f"输入记录 {len(all_records)} 条；去重后目标 {len(targets)} 家；已完成 {len(completed)} 家；本轮待查 {len(pending)} 家。")
-    print(f"筛选字段：Goodstack createdAt 与 claimedAt 均非空。输出目录：{args.output_dir}")
+                    continue
+    pending = [row for row in targets if row["inputKey"] not in completed]
+    print(f"名单 {len(records)} 条；去重后目标 {len(targets)} 家；已完成 {len(completed)} 家；本轮 {len(pending)} 家。")
+    print("搜索方式：Chromium 浏览器自动填写 Goodstack 公开页面；不需要 Goodstack API key。")
+    print("日期筛选：仅在网页搜索加载的数据中确实包含 createdAt 和 claimedAt 时才收录到 both_dates.json。")
     proxy = ProxyRotator()
-    print(f"网络模式：{proxy.mode}")
-    client = GoodstackClient(api_key, args.delay, args.retries, proxy)
+    print(f"代理模式：{proxy.mode}")
     try:
-        with checkpoint.open("a", encoding="utf-8") as stream:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        parser.error("Playwright 未安装；容器部署会自动安装。")
+    with checkpoint.open("a", encoding="utf-8") as stream, sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        try:
             for index, target in enumerate(pending, start=1):
                 try:
-                    result = check_target(client, target, args.page_cap)
-                except ApiError as exc:
+                    result = check_target(browser, proxy, target, args.delay, args.timeout)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
                     result = {
-                        "inputKey": target["inputKey"], "inputName": target["inputName"],
-                        "legalName": target["legalName"], "registrationNumber": target["registrationNumber"],
-                        "countryCode": target["countryCode"], "officialWebsite": target["officialWebsite"],
-                        "officialDomain": target["officialDomain"], "detectedDomain": target["detectedDomain"],
-                        "status": "query_error", "candidateCount": 0, "exactCandidateCount": 0,
-                        "bothDatesCandidateCount": 0, "candidates": [], "queryLog": [],
-                        "errors": [str(exc)], "checkedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                        "sourceRecord": target["sourceRecord"],
+                        "inputKey": target["inputKey"], "inputName": target["inputName"], "legalName": target["legalName"],
+                        "registrationNumber": target["registrationNumber"], "countryCode": target["countryCode"],
+                        "officialWebsite": target["officialWebsite"], "officialDomain": target["officialDomain"],
+                        "detectedDomain": target["detectedDomain"], "status": "query_error", "candidateCount": 0,
+                        "exactCandidateCount": 0, "bothDatesCandidateCount": 0, "candidates": [],
+                        "errors": [f"{type(exc).__name__}: {exc}"], "searchMethod": "chromium_public_page",
+                        "checkedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "sourceRecord": target["sourceRecord"],
                     }
                     print(f"错误：{target['inputName']} — {exc}", file=sys.stderr)
-                    if exc.status in (401, 403):
-                        raise
                 stream.write(json.dumps(result, ensure_ascii=False) + "\n")
                 stream.flush()
-                if index % 25 == 0 or index == len(pending):
+                if result.get("status") == "browser_challenge":
+                    print("检测到真人验证，停止后续自动查询。请稍后手动处理，脚本不会尝试绕过验证。", file=sys.stderr)
+                    break
+                if index % 10 == 0 or index == len(pending):
                     print(f"进度 {index}/{len(pending)}；最近：{target['inputName']} → {result['status']}")
                     save_outputs(args.output_dir, checkpoint, len(targets))
-    except KeyboardInterrupt:
-        print("收到中断信号，已保留 checkpoint；重新运行同一命令可续跑。", file=sys.stderr)
-        save_outputs(args.output_dir, checkpoint, len(targets))
-        return 130
+        except KeyboardInterrupt:
+            print("已中断；checkpoint 已保留，重新运行同一命令可从未完成记录续跑。", file=sys.stderr)
+            save_outputs(args.output_dir, checkpoint, len(targets))
+            return 130
+        finally:
+            browser.close()
     save_outputs(args.output_dir, checkpoint, len(targets))
-    print(f"完成。结果：{args.output_dir / 'summary.csv'}；双时间筛选：{args.output_dir / 'both_dates.json'}")
+    print(f"完成：{args.output_dir / 'summary.csv'}；双日期结果：{args.output_dir / 'both_dates.json'}")
     return 0
 
 

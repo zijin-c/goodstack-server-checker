@@ -43,34 +43,22 @@ read_env_value() {
   fi
 }
 
-GOODSTACK_API_KEY="${GOODSTACK_API_KEY:-$(read_env_value GOODSTACK_API_KEY)}"
 GOODSTACK_PROXY_URL="${GOODSTACK_PROXY_URL:-$(read_env_value GOODSTACK_PROXY_URL)}"
 GOODSTACK_PROXY_LIST_URL="${GOODSTACK_PROXY_LIST_URL:-$(read_env_value GOODSTACK_PROXY_LIST_URL)}"
 GOODSTACK_PROXY_TOKEN="${GOODSTACK_PROXY_TOKEN:-$(read_env_value GOODSTACK_PROXY_TOKEN)}"
 GOODSTACK_PROXY_REFRESH_SECONDS="${GOODSTACK_PROXY_REFRESH_SECONDS:-$(read_env_value GOODSTACK_PROXY_REFRESH_SECONDS)}"
 
-if [[ -z "$GOODSTACK_API_KEY" ]]; then
-  read -r -s -p "Goodstack API key (pk_ 或 sk_): " GOODSTACK_API_KEY
-  echo
-fi
-if [[ -z "$GOODSTACK_API_KEY" ]]; then
-  echo "未提供 GOODSTACK_API_KEY，已退出。" >&2
-  exit 1
-fi
-
 if [[ -z "$GOODSTACK_PROXY_URL" && -z "$GOODSTACK_PROXY_LIST_URL" ]]; then
-  echo "动态代理配置："
-  echo "  1) 轮换网关：服务商提供一个固定代理 URL，每次连接由服务商换 IP"
-  echo "  2) 代理池：填写服务商的代理列表 API，脚本下载并轮换池中代理"
-  echo "  3) 暂不使用代理"
+  echo "代理配置（Goodstack 页面可直连时可选 3）："
+  echo "  1) 轮换网关：代理服务商提供一个固定 HTTP(S) 网关 URL"
+  echo "  2) 代理池：代理服务商提供动态代理列表 API"
+  echo "  3) 直连"
   read -r -p "请选择 [1/2/3，默认 1]: " proxy_mode
   case "${proxy_mode:-1}" in
-    1)
-      read -r -p "轮换代理 URL（例如 http://user:pass@gateway.example:8000）: " GOODSTACK_PROXY_URL
-      ;;
+    1) read -r -s -p "轮换网关 URL: " GOODSTACK_PROXY_URL; echo ;;
     2)
       read -r -p "代理列表 API URL: " GOODSTACK_PROXY_LIST_URL
-      read -r -s -p "代理列表 API Bearer token（没有则直接回车）: " GOODSTACK_PROXY_TOKEN
+      read -r -s -p "代理列表 Bearer token（没有则回车）: " GOODSTACK_PROXY_TOKEN
       echo
       GOODSTACK_PROXY_REFRESH_SECONDS="${GOODSTACK_PROXY_REFRESH_SECONDS:-300}"
       ;;
@@ -80,14 +68,13 @@ if [[ -z "$GOODSTACK_PROXY_URL" && -z "$GOODSTACK_PROXY_LIST_URL" ]]; then
 fi
 
 if [[ -n "$GOODSTACK_PROXY_URL" && -n "$GOODSTACK_PROXY_LIST_URL" ]]; then
-  echo "GOODSTACK_PROXY_URL 与 GOODSTACK_PROXY_LIST_URL 只能选一种。" >&2
+  echo "GOODSTACK_PROXY_URL 与 GOODSTACK_PROXY_LIST_URL 只能配置一个。" >&2
   exit 2
 fi
 GOODSTACK_PROXY_REFRESH_SECONDS="${GOODSTACK_PROXY_REFRESH_SECONDS:-300}"
 
 umask 077
 {
-  printf 'GOODSTACK_API_KEY=%s\n' "$GOODSTACK_API_KEY"
   printf 'GOODSTACK_PROXY_URL=%s\n' "$GOODSTACK_PROXY_URL"
   printf 'GOODSTACK_PROXY_LIST_URL=%s\n' "$GOODSTACK_PROXY_LIST_URL"
   printf 'GOODSTACK_PROXY_TOKEN=%s\n' "$GOODSTACK_PROXY_TOKEN"
