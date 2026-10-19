@@ -38,7 +38,7 @@ chmod +x deploy.sh
 
 `--pilot` 先检查 20 家机构；确认 API 返回和结果正常后，再运行 `./deploy.sh` 开始全量任务。两次运行共用断点文件，已完成记录会自动跳过。后台执行可使用 `nohup ./deploy.sh > deploy.log 2>&1 &`，完成后查看 `data/results/summary.json`。
 
-部署脚本会检查 Docker 和 Compose 是否可用。若服务器尚未安装 Docker，请按 [Docker 官方 Ubuntu 安装文档](https://docs.docker.com/engine/install/ubuntu/) 安装后再运行。
+部署脚本在 Ubuntu / Debian 上以 root 运行时，会通过 Docker 官方 apt 仓库自动安装 Docker Engine 与 Compose 插件；其他发行版需要先按 [Docker 官方文档](https://docs.docker.com/engine/install/) 安装运行环境。
 
 ### 动态代理
 

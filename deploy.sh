@@ -5,8 +5,35 @@ APP_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$APP_DIR"
 
 if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
-  echo "Docker Engine 和 Docker Compose 插件尚未安装。请先安装 Docker，再重新运行本脚本。" >&2
-  exit 1
+  if [[ "$(id -u)" -ne 0 ]]; then
+    echo "Docker 未安装。请使用 root 运行本脚本，或先按 Docker 官方文档安装 Docker Engine 与 Compose。" >&2
+    exit 1
+  fi
+  if [[ ! -r /etc/os-release ]]; then
+    echo "无法识别 Linux 发行版，请先安装 Docker Engine 与 Compose。" >&2
+    exit 1
+  fi
+  . /etc/os-release
+  if [[ "${ID:-}" != "ubuntu" && "${ID:-}" != "debian" ]]; then
+    echo "自动安装目前支持 Ubuntu / Debian；请先按 Docker 官方文档安装 Docker Engine 与 Compose。" >&2
+    exit 1
+  fi
+  echo "正在通过 Docker 官方 apt 仓库安装 Docker Engine 和 Compose 插件……"
+  apt-get update
+  apt-get install -y ca-certificates curl
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL "https://download.docker.com/linux/${ID}/gpg" -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
+  codename="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
+  if [[ -z "$codename" ]]; then
+    echo "无法识别系统代号，Docker 仓库未配置。" >&2
+    exit 1
+  fi
+  printf 'Types: deb\nURIs: https://download.docker.com/linux/%s\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n' \
+    "$ID" "$codename" "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/docker.sources
+  apt-get update
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable --now docker
 fi
 
 read_env_value() {
