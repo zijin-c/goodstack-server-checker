@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Goodstack 机构核验</title>
+  <style>
+    :root{color-scheme:light;--ink:#17211d;--muted:#66736c;--line:#e3e9e5;--green:#147a52;--pale:#eff8f3;--amber:#9a5c08;--red:#aa3434;--bg:#f5f8f6}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);font:15px/1.5 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--ink)}
+    header{background:#fff;border-bottom:1px solid var(--line);padding:22px max(24px,calc((100vw - 1180px)/2));display:flex;justify-content:space-between;align-items:center;gap:16px}
+    h1{font-size:22px;margin:0;letter-spacing:-.3px}header p{margin:4px 0 0;color:var(--muted);font-size:13px}.tag{padding:7px 11px;border-radius:999px;background:var(--pale);color:var(--green);font-size:12px;font-weight:700;white-space:nowrap}
+    main{max-width:1180px;margin:24px auto;padding:0 20px 48px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.card,.panel{background:#fff;border:1px solid var(--line);border-radius:14px;box-shadow:0 2px 10px #17211d08}.card{padding:18px}.label{color:var(--muted);font-size:12px}.number{font-size:25px;font-weight:750;margin-top:7px}.progress-wrap{margin-top:12px;height:8px;background:#e9efeb;border-radius:9px;overflow:hidden}.progress{height:100%;width:0;background:var(--green);transition:width .3s}
+    .panel{margin-top:16px;padding:20px}.panel-head{display:flex;justify-content:space-between;align-items:center;gap:14px}.panel h2{font-size:16px;margin:0}.hint{font-size:12px;color:var(--muted);margin-top:4px}.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}.btn{border:0;border-radius:9px;padding:10px 14px;font:inherit;font-size:13px;font-weight:700;cursor:pointer;background:var(--green);color:#fff}.btn.secondary{background:#edf3ef;color:#26372f}.btn.danger{background:#fff1ef;color:var(--red)}.btn:disabled{opacity:.45;cursor:not-allowed}.links{display:flex;gap:10px}.link{color:var(--green);text-decoration:none;font-weight:650;font-size:13px}
+    .table-wrap{overflow:auto;margin-top:16px}table{width:100%;border-collapse:collapse;min-width:830px}th,td{text-align:left;padding:11px 10px;border-bottom:1px solid var(--line);font-size:13px;vertical-align:top}th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em}td code{font:12px ui-monospace,SFMono-Regular,monospace;color:#35483e}.empty{padding:30px;text-align:center;color:var(--muted)}
+    details{margin-top:16px}summary{cursor:pointer;font-weight:700;font-size:14px}pre{margin:12px 0 0;max-height:260px;overflow:auto;background:#101815;color:#d5e7dc;border-radius:10px;padding:14px;font-size:12px;white-space:pre-wrap}
+    #notice{display:none;margin-top:12px;padding:10px 12px;border-radius:9px;background:#fff7e8;color:var(--amber);font-size:13px}footer{margin-top:18px;color:var(--muted);font-size:12px}
+    @media(max-width:780px){header{align-items:flex-start;flex-direction:column}.grid{grid-template-columns:repeat(2,1fr)}.panel{padding:15px}.panel-head{align-items:flex-start;flex-direction:column}}
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>Goodstack 机构核验</h1><p>浏览器页面搜索 · 双日期筛选 · 断点续跑</p></div>
+    <span class="tag" id="state">正在连接…</span>
+  </header>
+  <main>
+    <section class="grid">
+      <div class="card"><div class="label">处理进度</div><div class="number" id="progressText">—</div><div class="progress-wrap"><div class="progress" id="progressBar"></div></div></div>
+      <div class="card"><div class="label">已处理机构</div><div class="number" id="processed">—</div></div>
+      <div class="card"><div class="label">双日期精确匹配</div><div class="number" id="matches">—</div></div>
+      <div class="card"><div class="label">当前任务</div><div class="number" id="runState" style="font-size:18px">—</div></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><div><h2>任务控制</h2><div class="hint">试跑 20 家；全量续跑会跳过已完成记录；重查会重新搜索全部名单。</div></div><div class="links"><a class="link" href="/download/both_dates.csv">下载 CSV</a><a class="link" href="/download/both_dates.json">下载 JSON</a></div></div>
+      <div class="actions">
+        <button class="btn" id="pilot">试跑 20 家</button>
+        <button class="btn secondary" id="full">全量续跑</button>
+        <button class="btn secondary" id="recheck">从头重查</button>
+        <button class="btn danger" id="stop">停止任务</button>
+      </div>
+      <div id="notice"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><div><h2>符合双日期条件的机构</h2><div class="hint" id="resultHint">仅显示精确匹配且 createdAt、claimedAt 均非空的结果。</div></div></div>
+      <div class="table-wrap"><table><thead><tr><th>机构</th><th>登记编号</th><th>官网</th><th>Goodstack ID</th><th>createdAt</th><th>claimedAt</th></tr></thead><tbody id="rows"><tr><td colspan="6" class="empty">还没有符合条件的结果</td></tr></tbody></table></div>
+    </section>
+    <section class="panel">
+      <details><summary>运行日志</summary><pre id="log">等待任务启动。</pre></details>
+    </section>
+    <footer>页面搜索遇到真人验证时会停止并保留断点。停止按钮会保留已完成机构的断点。</footer>
+  </main>
+  <script>
+    const $=id=>document.getElementById(id);
+    const esc=value=>String(value??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+    async function call(path,options={}){const response=await fetch(path,{cache:"no-store",...options,headers:{"Content-Type":"application/json",...(options.headers||{})}});if(!response.ok){let message=`请求失败 (${response.status})`;try{message=(await response.json()).error||message}catch{}throw new Error(message)}return response.json()}
+    function drawResults(results){const rows=$("rows");if(!results.length){rows.innerHTML='<tr><td colspan="6" class="empty">还没有符合条件的结果</td></tr>';return}rows.innerHTML=results.map(item=>{const t=item.target||{},o=item.organisation||{};return `<tr><td><strong>${esc(o.name||o.displayName)}</strong><div class="hint">${esc(t.inputName||"")}</div></td><td>${esc(o.registryId||t.registrationNumber||"—")}</td><td>${esc(o.website||"—")}</td><td><code>${esc(o.id||"—")}</code></td><td>${esc(o.createdAt||"")}</td><td>${esc(o.claimedAt||"")}</td></tr>`}).join("")}
+    async function refresh(){try{const s=await call("/api/status");$("state").textContent=s.running?"任务运行中":"服务已就绪";$("state").style.background=s.running?"#fff4df":"var(--pale)";$("state").style.color=s.running?"#9a5c08":"var(--green)";$("processed").textContent=`${s.processed} / ${s.total}`;$("progressText").textContent=`${s.progress}%`+` (${s.processed}/${s.total})`;$("progressBar").style.width=`${s.progress}%`;$("matches").textContent=s.bothDates;$("runState").textContent=s.running?"运行中":s.exitCode===null?"待启动":s.exitCode===0?"已完成":"已停止";$("pilot").disabled=s.running;$("full").disabled=s.running;$("recheck").disabled=s.running;$("stop").disabled=!s.running;const data=await call("/api/results?limit=100");drawResults(data.results||[]);$("resultHint").textContent=`当前 ${s.bothDates} 条符合双日期条件，表格最多展示 100 条。`;const log=await call("/api/log");$("log").textContent=(log.lines||[]).join("\n")||"等待任务启动。"}catch(error){$("state").textContent="连接失败";show(error.message)}}
+    function show(message){const box=$("notice");box.textContent=message;box.style.display="block";setTimeout(()=>box.style.display="none",6000)}
+    async function start(mode){try{const result=await call("/api/start",{method:"POST",body:JSON.stringify({mode})});show(result.started?"任务已启动":"任务未启动");refresh()}catch(error){show(error.message)}}
+    $("pilot").onclick=()=>start("pilot");$("full").onclick=()=>start("full");$("recheck").onclick=()=>{if(confirm("将重新搜索全部名单并覆盖每家机构的最新结果，确定继续？"))start("recheck")};
+    $("stop").onclick=async()=>{try{const result=await call("/api/stop",{method:"POST",body:"{}"});show(result.message);refresh()}catch(error){show(error.message)}};
+    refresh();setInterval(refresh,5000);
+  </script>
+</body>
+</html>

@@ -2,12 +2,7 @@ services:
   goodstack-check:
     build: .
     env_file: .env
+    ports:
+      - "${UI_PORT:-8765}:8765"
     volumes:
       - ./data:/data
-    command:
-      - --input
-      - /data/input.json
-      - --output-dir
-      - /data/results
-      - --delay
-      - "2.0"

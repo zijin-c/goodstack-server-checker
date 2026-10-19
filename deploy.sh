@@ -47,6 +47,14 @@ GOODSTACK_PROXY_URL="${GOODSTACK_PROXY_URL:-$(read_env_value GOODSTACK_PROXY_URL
 GOODSTACK_PROXY_LIST_URL="${GOODSTACK_PROXY_LIST_URL:-$(read_env_value GOODSTACK_PROXY_LIST_URL)}"
 GOODSTACK_PROXY_TOKEN="${GOODSTACK_PROXY_TOKEN:-$(read_env_value GOODSTACK_PROXY_TOKEN)}"
 GOODSTACK_PROXY_REFRESH_SECONDS="${GOODSTACK_PROXY_REFRESH_SECONDS:-$(read_env_value GOODSTACK_PROXY_REFRESH_SECONDS)}"
+UI_PORT="${UI_PORT:-$(read_env_value UI_PORT)}"
+UI_USERNAME="${UI_USERNAME:-$(read_env_value UI_USERNAME)}"
+UI_PASSWORD="${UI_PASSWORD:-$(read_env_value UI_PASSWORD)}"
+UI_PORT="${UI_PORT:-8765}"
+UI_USERNAME="${UI_USERNAME:-admin}"
+if [[ -z "$UI_PASSWORD" ]]; then
+  UI_PASSWORD="$(od -An -N18 -tx1 /dev/urandom | tr -d ' \n')"
+fi
 
 if [[ -z "$GOODSTACK_PROXY_URL" && -z "$GOODSTACK_PROXY_LIST_URL" ]]; then
   echo "代理配置（Goodstack 页面可直连时可选 3）："
@@ -79,12 +87,18 @@ umask 077
   printf 'GOODSTACK_PROXY_LIST_URL=%s\n' "$GOODSTACK_PROXY_LIST_URL"
   printf 'GOODSTACK_PROXY_TOKEN=%s\n' "$GOODSTACK_PROXY_TOKEN"
   printf 'GOODSTACK_PROXY_REFRESH_SECONDS=%s\n' "$GOODSTACK_PROXY_REFRESH_SECONDS"
+  printf 'UI_PORT=%s\n' "$UI_PORT"
+  printf 'UI_USERNAME=%s\n' "$UI_USERNAME"
+  printf 'UI_PASSWORD=%s\n' "$UI_PASSWORD"
 } > .env
 chmod 600 .env
 
 docker compose build
-if [[ "${1:-}" == "--pilot" ]]; then
-  docker compose run --rm goodstack-check --max-records 20
-else
-  docker compose run --rm goodstack-check
-fi
+docker compose up -d --force-recreate goodstack-check
+echo
+echo "Goodstack 网页控制台已启动："
+echo "  浏览器地址: http://<VPS 公网 IP>:${UI_PORT}"
+echo "  登录用户名: ${UI_USERNAME}"
+echo "  登录密码: ${UI_PASSWORD}"
+echo "  容器日志: docker compose logs -f goodstack-check"
+echo "请在浏览器里打开控制台后点击「试跑 20 家」或「全量续跑」。"

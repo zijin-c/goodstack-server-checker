@@ -4,13 +4,15 @@
 
 ## 一键部署
 
-在 Ubuntu / Debian VPS 上以 root 运行：
+在 Ubuntu / Debian VPS 上以 root 运行一键部署命令：
 
 ```bash
-git clone https://github.com/zijin-c/goodstack-server-checker.git && cd goodstack-server-checker && chmod +x deploy.sh && ./deploy.sh --pilot
+git clone https://github.com/zijin-c/goodstack-server-checker.git && cd goodstack-server-checker && chmod +x deploy.sh && ./deploy.sh
 ```
 
-`--pilot` 先搜索 20 家；确认结果后执行 `./deploy.sh` 开始全量名单。断点会保存在 `data/results/checkpoint.jsonl`，重跑时自动跳过已完成项。脚本会在 Ubuntu / Debian 上通过 Docker 官方 apt 仓库安装 Docker 与 Compose，并构建带 Chromium 的运行镜像。
+部署后浏览器打开 `http://<VPS 公网 IP>:8765`。脚本会生成 UI 登录用户名和密码并在终端显示；默认用户名为 `admin`。在页面中可点击“试跑 20 家”“全量续跑”“从头重查”或“停止任务”，也能查看进度、日志并下载筛选结果。首次运行会在 Ubuntu / Debian 上通过 Docker 官方 apt 仓库安装 Docker 与 Compose，并构建带 Chromium 和控制台的镜像。
+
+如果云厂商安全组或 VPS 防火墙限制入站连接，请放行 TCP 8765 才能从浏览器访问。UI 端口可在部署目录的 `.env` 中通过 `UI_PORT` 修改。
 
 ## 日期字段
 
@@ -32,14 +34,15 @@ git clone https://github.com/zijin-c/goodstack-server-checker.git && cd goodstac
 ## 常用命令
 
 ```bash
-# 完整批次
-./deploy.sh
+# 更新代码并重建控制台
+git pull && ./deploy.sh
 
-# 仅在需要时无视断点重查
-docker compose run --rm goodstack-check --no-resume
+# 查看容器日志
+docker compose logs -f goodstack-check
 
+# 批次运行、暂停和下载结果均在网页控制台完成
 # 查看进度摘要
 cat data/results/summary.json
 ```
 
-默认每次页面搜索间隔 2 秒；2300 条记录可能运行数小时。需要后台执行时可用 `nohup ./deploy.sh > deploy.log 2>&1 &`，之后查看 `tail -f deploy.log`。
+默认每次页面搜索间隔 2 秒；2300 条记录可能运行数小时。控制台和批次任务会在 Docker 后台运行，关闭浏览器不影响任务。
